@@ -7,13 +7,15 @@ package multiplex
 // remote side before packet0. Cloak have to therefore sequence the packets so that they
 // arrive in order as they were sent by the proxy software
 //
-// Cloak packets will have a 32-bit sequence number on them, so we know in which order
+// Cloak packets will have a 64-bit sequence number on them, so we know in which order
 // they should be sent to the proxy software. The code in this file provides buffering and sorting.
 
 import (
 	"container/heap"
 	"fmt"
+	"io"
 	"sync"
+	"time"
 )
 
 type sorterHeap []*Frame
@@ -44,7 +46,6 @@ type streamBuffer struct {
 	recvM sync.Mutex
 
 	nextRecvSeq uint64
-	rev         int
 	sh          sorterHeap
 
 	buf *bufferedPipe
@@ -53,53 +54,57 @@ type streamBuffer struct {
 func NewStreamBuffer() *streamBuffer {
 	sb := &streamBuffer{
 		sh:  []*Frame{},
-		rev: 0,
 		buf: NewBufferedPipe(),
 	}
 	return sb
 }
 
-// recvNewFrame is a forever running loop which receives frames unordered,
-// cache and order them and send them into sortedBufCh
-func (sb *streamBuffer) Write(f Frame) error {
+func (sb *streamBuffer) Write(f Frame) (toBeClosed bool, err error) {
 	sb.recvM.Lock()
 	defer sb.recvM.Unlock()
 	// when there'fs no ooo packages in heap and we receive the next package in order
 	if len(sb.sh) == 0 && f.Seq == sb.nextRecvSeq {
-		if f.Closing == 1 {
-			sb.buf.Close()
-			return nil
+		if f.Closing != C_NOOP {
+			return true, nil
 		} else {
 			sb.buf.Write(f.Payload)
 			sb.nextRecvSeq += 1
 		}
-		return nil
+		return false, nil
 	}
 
 	if f.Seq < sb.nextRecvSeq {
-		return fmt.Errorf("seq %v is smaller than nextRecvSeq %v", f.Seq, sb.nextRecvSeq)
+		return false, fmt.Errorf("seq %v is smaller than nextRecvSeq %v", f.Seq, sb.nextRecvSeq)
 	}
 
 	heap.Push(&sb.sh, &f)
 	// Keep popping from the heap until empty or to the point that the wanted seq was not received
 	for len(sb.sh) > 0 && sb.sh[0].Seq == sb.nextRecvSeq {
 		f = *heap.Pop(&sb.sh).(*Frame)
-		if f.Closing == 1 {
-			// empty data indicates closing signal
-			sb.buf.Close()
-			return nil
+		if f.Closing != C_NOOP {
+			return true, nil
 		} else {
 			sb.buf.Write(f.Payload)
 			sb.nextRecvSeq += 1
 		}
 	}
-	return nil
+	return false, nil
 }
 
 func (sb *streamBuffer) Read(buf []byte) (int, error) {
 	return sb.buf.Read(buf)
 }
 
+func (sb *streamBuffer) WriteTo(w io.Writer) (int64, error) {
+	return sb.buf.WriteTo(w)
+}
+
 func (sb *streamBuffer) Close() error {
+	sb.recvM.Lock()
+	defer sb.recvM.Unlock()
+
 	return sb.buf.Close()
 }
+
+func (sb *streamBuffer) SetReadDeadline(t time.Time)       { sb.buf.SetReadDeadline(t) }
+func (sb *streamBuffer) SetWriteToTimeout(d time.Duration) { sb.buf.SetWriteToTimeout(d) }

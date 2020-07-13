@@ -60,7 +60,7 @@ func TestReadBlock(t *testing.T) {
 	pipe := NewBufferedPipe()
 	b := []byte{0x01, 0x02, 0x03}
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		pipe.Write(b)
 	}()
 	b2 := make([]byte, len(b))
@@ -192,16 +192,9 @@ func BenchmarkBufferedPipe_RW(b *testing.B) {
 			pipe.Read(smallBuf)
 		}
 	}()
+	b.SetBytes(int64(len(testData)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := pipe.Write(testData)
-		if err != nil {
-			b.Error(
-				"For", "pipe write",
-				"got", err,
-			)
-			return
-		}
-		b.SetBytes(PAYLOAD_LEN)
+		pipe.Write(testData)
 	}
 }

@@ -1,9 +1,10 @@
 package client
 
-import "net"
+import (
+	"net"
+)
 
 type Transport interface {
-	PrepareConnection(*State, net.Conn) (net.Conn, []byte, error)
-	HasRecordLayer() bool
-	UnitReadFunc() func(net.Conn, []byte) (int, error)
+	Handshake(rawConn net.Conn, authInfo AuthInfo) (sessionKey [32]byte, err error)
+	net.Conn
 }

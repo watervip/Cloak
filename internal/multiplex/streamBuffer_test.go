@@ -2,8 +2,7 @@ package multiplex
 
 import (
 	"encoding/binary"
-	"time"
-
+	"io"
 	//"log"
 	"sort"
 	"testing"
@@ -28,8 +27,6 @@ func TestRecvNewFrame(t *testing.T) {
 			sb.Write(frame)
 		}
 
-		time.Sleep(100 * time.Millisecond)
-
 		var sortedResult []uint64
 		for x := 0; x < len(set); x++ {
 			oct := make([]byte, 8)
@@ -45,7 +42,7 @@ func TestRecvNewFrame(t *testing.T) {
 		copy(targetSorted, set)
 		sort.Slice(targetSorted, func(i, j int) bool { return targetSorted[i] < targetSorted[j] })
 
-		for i, _ := range targetSorted {
+		for i := range targetSorted {
 			if sortedResult[i] != targetSorted[i] {
 				goto fail
 			}
@@ -71,4 +68,24 @@ func TestRecvNewFrame(t *testing.T) {
 	t.Run("out of order wrap", func(t *testing.T) {
 		test(outOfOrder2, t)
 	})
+}
+
+func TestStreamBuffer_RecvThenClose(t *testing.T) {
+	const testDataLen = 128
+	sb := NewStreamBuffer()
+	testData := make([]byte, testDataLen)
+	testFrame := Frame{
+		StreamID: 0,
+		Seq:      0,
+		Closing:  0,
+		Payload:  testData,
+	}
+	sb.Write(testFrame)
+	sb.Close()
+
+	readBuf := make([]byte, testDataLen)
+	_, err := io.ReadFull(sb, readBuf)
+	if err != nil {
+		t.Error(err)
+	}
 }

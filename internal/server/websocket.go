@@ -1,112 +1,96 @@
 package server
 
 import (
+	"bufio"
+	"bytes"
 	"crypto"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/cbeuw/Cloak/internal/common"
 	"github.com/cbeuw/Cloak/internal/ecdh"
-	"github.com/cbeuw/Cloak/internal/util"
-	"github.com/gorilla/websocket"
+	"io"
 	"net"
 	"net/http"
-
-	log "github.com/sirupsen/logrus"
 )
 
-// since we need to read the first packet from the client to identify its protocol, the first packet will no longer
-// be in Conn's buffer. However, websocket.Upgrade relies on reading the first packet for handshake, so we must
-// fake a conn that returns the first packet on first read
-type firstBuffedConn struct {
-	net.Conn
-	firstRead   bool
-	firstPacket []byte
-}
+type WebSocket struct{}
 
-func (c *firstBuffedConn) Read(buf []byte) (int, error) {
-	if !c.firstRead {
-		c.firstRead = true
-		copy(buf, c.firstPacket)
-		n := len(c.firstPacket)
-		c.firstPacket = []byte{}
-		return n, nil
-	}
-	return c.Conn.Read(buf)
-}
+func (WebSocket) String() string { return "WebSocket" }
 
-type wsAcceptor struct {
-	done bool
-	c    *firstBuffedConn
-}
-
-// net/http provides no method to serve an existing connection, we must feed in a net.Accept interface to get an
-// http.Server. This is an acceptor that accepts only one Conn
-func newWsAcceptor(conn net.Conn, first []byte) *wsAcceptor {
-	f := make([]byte, len(first))
-	copy(f, first)
-	return &wsAcceptor{
-		c: &firstBuffedConn{Conn: conn, firstPacket: f},
-	}
-}
-
-func (w *wsAcceptor) Accept() (net.Conn, error) {
-	if w.done {
-		return nil, errors.New("already accepted")
-	}
-	w.done = true
-	return w.c, nil
-}
-
-func (w *wsAcceptor) Close() error {
-	w.done = true
-	return nil
-}
-
-func (w *wsAcceptor) Addr() net.Addr {
-	return w.c.LocalAddr()
-}
-
-type wsHandshakeHandler struct {
-	conn     net.Conn
-	finished chan struct{}
-}
-
-// the handler to turn a net.Conn into a websocket.Conn
-func newWsHandshakeHandler() *wsHandshakeHandler {
-	return &wsHandshakeHandler{finished: make(chan struct{})}
-}
-
-func (ws *wsHandshakeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	upgrader := websocket.Upgrader{}
-	c, err := upgrader.Upgrade(w, r, nil)
+func (WebSocket) processFirstPacket(reqPacket []byte, privateKey crypto.PrivateKey) (fragments authFragments, respond Responder, err error) {
+	var req *http.Request
+	req, err = http.ReadRequest(bufio.NewReader(bytes.NewBuffer(reqPacket)))
 	if err != nil {
-		log.Errorf("failed to upgrade connection to ws: %v", err)
+		err = fmt.Errorf("failed to parse first HTTP GET: %v", err)
 		return
 	}
-	ws.conn = &util.WebSocketConn{Conn: c}
-	ws.finished <- struct{}{}
+	var hiddenData []byte
+	hiddenData, err = base64.StdEncoding.DecodeString(req.Header.Get("hidden"))
+
+	fragments, err = WebSocket{}.unmarshalHidden(hiddenData, privateKey)
+	if err != nil {
+		err = fmt.Errorf("failed to unmarshal hidden data from WS into authFragments: %v", err)
+		return
+	}
+
+	respond = WebSocket{}.makeResponder(reqPacket, fragments.sharedSecret)
+
+	return
+}
+
+func (WebSocket) makeResponder(reqPacket []byte, sharedSecret [32]byte) Responder {
+	respond := func(originalConn net.Conn, sessionKey [32]byte, randSource io.Reader) (preparedConn net.Conn, err error) {
+		handler := newWsHandshakeHandler()
+
+		// For an explanation of the following 3 lines, see the comments in websocketAux.go
+		http.Serve(newWsAcceptor(originalConn, reqPacket), handler)
+
+		<-handler.finished
+		preparedConn = handler.conn
+		nonce := make([]byte, 12)
+		common.RandRead(randSource, nonce)
+
+		// reply: [12 bytes nonce][32 bytes encrypted session key][16 bytes authentication tag]
+		encryptedKey, err := common.AESGCMEncrypt(nonce, sharedSecret[:], sessionKey[:]) // 32 + 16 = 48 bytes
+		if err != nil {
+			err = fmt.Errorf("failed to encrypt reply: %v", err)
+			return
+		}
+		reply := append(nonce, encryptedKey...)
+		_, err = preparedConn.Write(reply)
+		if err != nil {
+			err = fmt.Errorf("failed to write reply: %v", err)
+			preparedConn.Close()
+			return
+		}
+		return
+	}
+	return respond
 }
 
 var ErrBadGET = errors.New("non (or malformed) HTTP GET")
 
-func unmarshalHidden(hidden []byte, staticPv crypto.PrivateKey) (ai authenticationInfo, err error) {
+func (WebSocket) unmarshalHidden(hidden []byte, staticPv crypto.PrivateKey) (fragments authFragments, err error) {
 	if len(hidden) < 96 {
 		err = ErrBadGET
 		return
 	}
-	ephPub, ok := ecdh.Unmarshal(hidden[0:32])
+
+	copy(fragments.randPubKey[:], hidden[0:32])
+	ephPub, ok := ecdh.Unmarshal(fragments.randPubKey[:])
 	if !ok {
 		err = ErrInvalidPubKey
 		return
 	}
 
-	ai.nonce = hidden[:12]
+	copy(fragments.sharedSecret[:], ecdh.GenerateSharedSecret(staticPv, ephPub))
 
-	ai.sharedSecret = ecdh.GenerateSharedSecret(staticPv, ephPub)
-
-	ai.ciphertextWithTag = hidden[32:]
-	if len(ai.ciphertextWithTag) != 64 {
-		err = fmt.Errorf("%v: %v", ErrCiphertextLength, len(ai.ciphertextWithTag))
+	if len(hidden[32:]) != 64 {
+		err = fmt.Errorf("%v: %v", ErrCiphertextLength, len(hidden[32:]))
 		return
 	}
+
+	copy(fragments.ciphertextWithTag[:], hidden[32:])
 	return
 }

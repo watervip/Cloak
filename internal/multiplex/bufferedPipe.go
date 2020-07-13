@@ -4,23 +4,29 @@ package multiplex
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync"
-	"sync/atomic"
+	"time"
 )
 
 const BUF_SIZE_LIMIT = 1 << 20 * 500
 
+var ErrTimeout = errors.New("deadline exceeded")
+
 // The point of a bufferedPipe is that Read() will block until data is available
 type bufferedPipe struct {
-	buf    *bytes.Buffer
-	closed uint32
-	rwCond *sync.Cond
+	// only alloc when on first Read or Write
+	buf *bytes.Buffer
+
+	closed    bool
+	rwCond    *sync.Cond
+	rDeadline time.Time
+	wtTimeout time.Duration
 }
 
 func NewBufferedPipe() *bufferedPipe {
 	p := &bufferedPipe{
-		buf:    new(bytes.Buffer),
 		rwCond: sync.NewCond(&sync.Mutex{}),
 	}
 	return p
@@ -29,11 +35,20 @@ func NewBufferedPipe() *bufferedPipe {
 func (p *bufferedPipe) Read(target []byte) (int, error) {
 	p.rwCond.L.Lock()
 	defer p.rwCond.L.Unlock()
+	if p.buf == nil {
+		p.buf = new(bytes.Buffer)
+	}
 	for {
-		if atomic.LoadUint32(&p.closed) == 1 && p.buf.Len() == 0 {
+		if p.closed && p.buf.Len() == 0 {
 			return 0, io.EOF
 		}
-
+		if !p.rDeadline.IsZero() {
+			d := time.Until(p.rDeadline)
+			if d <= 0 {
+				return 0, ErrTimeout
+			}
+			time.AfterFunc(d, p.rwCond.Broadcast)
+		}
 		if p.buf.Len() > 0 {
 			break
 		}
@@ -45,11 +60,52 @@ func (p *bufferedPipe) Read(target []byte) (int, error) {
 	return n, err
 }
 
+func (p *bufferedPipe) WriteTo(w io.Writer) (n int64, err error) {
+	p.rwCond.L.Lock()
+	defer p.rwCond.L.Unlock()
+	if p.buf == nil {
+		p.buf = new(bytes.Buffer)
+	}
+	for {
+		if p.closed && p.buf.Len() == 0 {
+			return 0, io.EOF
+		}
+		if !p.rDeadline.IsZero() {
+			d := time.Until(p.rDeadline)
+			if d <= 0 {
+				return 0, ErrTimeout
+			}
+			if p.wtTimeout == 0 {
+				// if there hasn't been a scheduled broadcast
+				time.AfterFunc(d, p.rwCond.Broadcast)
+			}
+		}
+		if p.wtTimeout != 0 {
+			p.rDeadline = time.Now().Add(p.wtTimeout)
+			time.AfterFunc(p.wtTimeout, p.rwCond.Broadcast)
+		}
+		if p.buf.Len() > 0 {
+			written, er := p.buf.WriteTo(w)
+			n += written
+			if er != nil {
+				p.rwCond.Broadcast()
+				return n, er
+			}
+			p.rwCond.Broadcast()
+		} else {
+			p.rwCond.Wait()
+		}
+	}
+}
+
 func (p *bufferedPipe) Write(input []byte) (int, error) {
 	p.rwCond.L.Lock()
 	defer p.rwCond.L.Unlock()
+	if p.buf == nil {
+		p.buf = new(bytes.Buffer)
+	}
 	for {
-		if atomic.LoadUint32(&p.closed) == 1 {
+		if p.closed {
 			return 0, io.ErrClosedPipe
 		}
 		if p.buf.Len() <= BUF_SIZE_LIMIT {
@@ -65,13 +121,26 @@ func (p *bufferedPipe) Write(input []byte) (int, error) {
 }
 
 func (p *bufferedPipe) Close() error {
-	atomic.StoreUint32(&p.closed, 1)
+	p.rwCond.L.Lock()
+	defer p.rwCond.L.Unlock()
+
+	p.closed = true
 	p.rwCond.Broadcast()
 	return nil
 }
 
-func (p *bufferedPipe) Len() int {
+func (p *bufferedPipe) SetReadDeadline(t time.Time) {
 	p.rwCond.L.Lock()
 	defer p.rwCond.L.Unlock()
-	return p.buf.Len()
+
+	p.rDeadline = t
+	p.rwCond.Broadcast()
+}
+
+func (p *bufferedPipe) SetWriteToTimeout(d time.Duration) {
+	p.rwCond.L.Lock()
+	defer p.rwCond.L.Unlock()
+
+	p.wtTimeout = d
+	p.rwCond.Broadcast()
 }

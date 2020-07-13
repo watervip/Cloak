@@ -1,8 +1,15 @@
 package multiplex
 
-import "io"
+import (
+	"io"
+	"time"
+)
 
 type recvBuffer interface {
+	// Read calls' err must be nil | io.EOF | io.ErrShortBuffer
 	io.ReadCloser
-	Write(Frame) error
+	io.WriterTo
+	Write(Frame) (toBeClosed bool, err error)
+	SetReadDeadline(time time.Time)
+	SetWriteToTimeout(d time.Duration)
 }

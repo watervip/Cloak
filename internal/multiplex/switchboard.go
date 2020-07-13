@@ -15,47 +15,44 @@ const (
 )
 
 type switchboardConfig struct {
-	Valve
-	strategy switchboardStrategy
+	valve          Valve
+	strategy       switchboardStrategy
+	recvBufferSize int
 }
 
 // switchboard is responsible for keeping the reference of TCP connections between client and server
 type switchboard struct {
 	session *Session
 
-	*switchboardConfig
+	switchboardConfig
 
 	conns      sync.Map
+	numConns   uint32
 	nextConnId uint32
 
 	broken uint32
 }
 
-func makeSwitchboard(sesh *Session, config *switchboardConfig) *switchboard {
+func makeSwitchboard(sesh *Session, config switchboardConfig) *switchboard {
 	// rates are uint64 because in the usermanager we want the bandwidth to be atomically
 	// operated (so that the bandwidth can change on the fly).
 	sb := &switchboard{
 		session:           sesh,
 		switchboardConfig: config,
+		nextConnId:        1,
 	}
 	return sb
 }
 
-var errNilOptimum = errors.New("The optimal connection is nil")
 var errBrokenSwitchboard = errors.New("the switchboard is broken")
 
 func (sb *switchboard) connsCount() int {
-	// count the number of entries in conns
-	var count int
-	sb.conns.Range(func(_, _ interface{}) bool {
-		count += 1
-		return true
-	})
-	return count
+	return int(atomic.LoadUint32(&sb.numConns))
 }
 
 func (sb *switchboard) addConn(conn net.Conn) {
 	connId := atomic.AddUint32(&sb.nextConnId, 1) - 1
+	atomic.AddUint32(&sb.numConns, 1)
 	sb.conns.Store(connId, conn)
 	go sb.deplex(connId, conn)
 }
@@ -65,40 +62,42 @@ func (sb *switchboard) send(data []byte, connId *uint32) (n int, err error) {
 	writeAndRegUsage := func(conn net.Conn, d []byte) (int, error) {
 		n, err = conn.Write(d)
 		if err != nil {
+			sb.conns.Delete(*connId)
 			sb.close("failed to write to remote " + err.Error())
 			return n, err
 		}
-		sb.AddTx(int64(n))
+		sb.valve.AddTx(int64(n))
 		return n, nil
 	}
 
-	sb.Valve.txWait(len(data))
-	connCount := sb.connsCount()
-	if atomic.LoadUint32(&sb.broken) == 1 || connCount == 0 {
+	sb.valve.txWait(len(data))
+	if atomic.LoadUint32(&sb.broken) == 1 || sb.connsCount() == 0 {
 		return 0, errBrokenSwitchboard
 	}
 
-	if sb.strategy == UNIFORM_SPREAD {
+	switch sb.strategy {
+	case UNIFORM_SPREAD:
 		_, conn, err := sb.pickRandConn()
 		if err != nil {
 			return 0, errBrokenSwitchboard
 		}
 		return writeAndRegUsage(conn, data)
-	} else {
+	case FIXED_CONN_MAPPING:
 		connI, ok := sb.conns.Load(*connId)
-		conn := connI.(net.Conn)
 		if ok {
+			conn := connI.(net.Conn)
 			return writeAndRegUsage(conn, data)
 		} else {
 			newConnId, conn, err := sb.pickRandConn()
 			if err != nil {
 				return 0, errBrokenSwitchboard
 			}
-			connId = &newConnId
+			*connId = newConnId
 			return writeAndRegUsage(conn, data)
 		}
+	default:
+		return 0, errors.New("unsupported traffic distribution strategy")
 	}
-
 }
 
 // returns a random connId
@@ -114,8 +113,8 @@ func (sb *switchboard) pickRandConn() (uint32, net.Conn, error) {
 	var id uint32
 	var conn net.Conn
 	r := rand.Intn(connCount)
+	var c int
 	sb.conns.Range(func(connIdI, connI interface{}) bool {
-		var c int
 		if r == c {
 			id = connIdI.(uint32)
 			conn = connI.(net.Conn)
@@ -124,6 +123,10 @@ func (sb *switchboard) pickRandConn() (uint32, net.Conn, error) {
 		c++
 		return true
 	})
+	// if len(sb.conns) is 0
+	if conn == nil {
+		return 0, nil, errBrokenSwitchboard
+	}
 	return id, conn, nil
 }
 
@@ -147,14 +150,16 @@ func (sb *switchboard) closeAll() {
 
 // deplex function costantly reads from a TCP connection
 func (sb *switchboard) deplex(connId uint32, conn net.Conn) {
-	buf := make([]byte, 20480)
+	defer conn.Close()
+	buf := make([]byte, sb.recvBufferSize)
 	for {
-		n, err := sb.session.UnitRead(conn, buf)
-		sb.rxWait(n)
-		sb.Valve.AddRx(int64(n))
+		n, err := conn.Read(buf)
+		sb.valve.rxWait(n)
+		sb.valve.AddRx(int64(n))
 		if err != nil {
 			log.Debugf("a connection for session %v has closed: %v", sb.session.id, err)
-			go conn.Close()
+			sb.conns.Delete(connId)
+			atomic.AddUint32(&sb.numConns, ^uint32(0))
 			sb.close("a connection has dropped unexpectedly")
 			return
 		}

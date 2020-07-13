@@ -3,9 +3,9 @@
 package client
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"github.com/cbeuw/Cloak/internal/common"
 )
 
 type Firefox struct{}
@@ -19,7 +19,7 @@ func (f *Firefox) composeExtensions(SNI []byte, keyShare []byte) []byte {
 		copy(ret[6:38], hidden)
 		ret[38], ret[39] = 0x00, 0x17 // group secp256r1
 		ret[40], ret[41] = 0x00, 0x41 // length 65
-		rand.Read(ret[42:107])
+		common.CryptoRandRead(ret[42:107])
 		return ret
 	}
 	// extension length is always 399, and server name length is variable
@@ -51,21 +51,21 @@ func (f *Firefox) composeExtensions(SNI []byte, keyShare []byte) []byte {
 	return ret
 }
 
-func (f *Firefox) composeClientHello(hd chHiddenData) (ch []byte) {
+func (f *Firefox) composeClientHello(hd clientHelloFields) (ch []byte) {
 	var clientHello [12][]byte
 	clientHello[0] = []byte{0x01}             // handshake type
 	clientHello[1] = []byte{0x00, 0x01, 0xfc} // length 508
 	clientHello[2] = []byte{0x03, 0x03}       // client version
-	clientHello[3] = hd.chRandom              // random
+	clientHello[3] = hd.random                // random
 	clientHello[4] = []byte{0x20}             // session id length 32
-	clientHello[5] = hd.chSessionId           // session id
+	clientHello[5] = hd.sessionId             // session id
 	clientHello[6] = []byte{0x00, 0x24}       // cipher suites length 36
 	cipherSuites, _ := hex.DecodeString("130113031302c02bc02fcca9cca8c02cc030c00ac009c013c01400330039002f0035000a")
 	clientHello[7] = cipherSuites // cipher suites
 	clientHello[8] = []byte{0x01} // compression methods length 1
 	clientHello[9] = []byte{0x00} // compression methods
 
-	clientHello[11] = f.composeExtensions(hd.chExtSNI, hd.chX25519KeyShare)
+	clientHello[11] = f.composeExtensions(hd.sni, hd.x25519KeyShare)
 	clientHello[10] = []byte{0x00, 0x00} // extensions length
 	binary.BigEndian.PutUint16(clientHello[10], uint16(len(clientHello[11])))
 

@@ -1,23 +1,16 @@
 package server
 
 import (
-	"github.com/cbeuw/Cloak/internal/util"
+	"crypto"
+	"errors"
+	"io"
 	"net"
 )
 
+type Responder = func(originalConn net.Conn, sessionKey [32]byte, randSource io.Reader) (preparedConn net.Conn, err error)
 type Transport interface {
-	HasRecordLayer() bool
-	UnitReadFunc() func(net.Conn, []byte) (int, error)
+	processFirstPacket(reqPacket []byte, privateKey crypto.PrivateKey) (authFragments, Responder, error)
 }
 
-type TLS struct{}
-
-func (TLS) String() string                                    { return "TLS" }
-func (TLS) HasRecordLayer() bool                              { return true }
-func (TLS) UnitReadFunc() func(net.Conn, []byte) (int, error) { return util.ReadTLS }
-
-type WebSocket struct{}
-
-func (WebSocket) String() string                                    { return "WebSocket" }
-func (WebSocket) HasRecordLayer() bool                              { return false }
-func (WebSocket) UnitReadFunc() func(net.Conn, []byte) (int, error) { return util.ReadWebSocket }
+var ErrInvalidPubKey = errors.New("public key has invalid format")
+var ErrCiphertextLength = errors.New("ciphertext has the wrong length")

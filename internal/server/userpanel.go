@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"github.com/cbeuw/Cloak/internal/server/usermanager"
 	"sync"
 	"sync/atomic"
@@ -10,6 +11,9 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const defaultUploadInterval = 1 * time.Minute
+
+// userPanel is used to authenticate new users and book keep active users
 type userPanel struct {
 	Manager usermanager.UserManager
 
@@ -17,6 +21,8 @@ type userPanel struct {
 	activeUsers       map[[16]byte]*ActiveUser
 	usageUpdateQueueM sync.Mutex
 	usageUpdateQueue  map[[16]byte]*usagePair
+
+	uploadInterval time.Duration
 }
 
 func MakeUserPanel(manager usermanager.UserManager) *userPanel {
@@ -24,6 +30,7 @@ func MakeUserPanel(manager usermanager.UserManager) *userPanel {
 		Manager:          manager,
 		activeUsers:      make(map[[16]byte]*ActiveUser),
 		usageUpdateQueue: make(map[[16]byte]*usagePair),
+		uploadInterval:   defaultUploadInterval,
 	}
 	go ret.regularQueueUpload()
 	return ret
@@ -32,10 +39,10 @@ func MakeUserPanel(manager usermanager.UserManager) *userPanel {
 // GetBypassUser does the same as GetUser except it unconditionally creates an ActiveUser when the UID isn't already active
 func (panel *userPanel) GetBypassUser(UID []byte) (*ActiveUser, error) {
 	panel.activeUsersM.Lock()
+	defer panel.activeUsersM.Unlock()
 	var arrUID [16]byte
 	copy(arrUID[:], UID)
 	if user, ok := panel.activeUsers[arrUID]; ok {
-		panel.activeUsersM.Unlock()
 		return user, nil
 	}
 	user := &ActiveUser{
@@ -46,7 +53,6 @@ func (panel *userPanel) GetBypassUser(UID []byte) (*ActiveUser, error) {
 	}
 	copy(user.arrUID[:], UID)
 	panel.activeUsers[user.arrUID] = user
-	panel.activeUsersM.Unlock()
 	return user, nil
 }
 
@@ -54,16 +60,15 @@ func (panel *userPanel) GetBypassUser(UID []byte) (*ActiveUser, error) {
 // UID with UserInfo queried from the UserManger, should the particular UID is allowed to connect
 func (panel *userPanel) GetUser(UID []byte) (*ActiveUser, error) {
 	panel.activeUsersM.Lock()
+	defer panel.activeUsersM.Unlock()
 	var arrUID [16]byte
 	copy(arrUID[:], UID)
 	if user, ok := panel.activeUsers[arrUID]; ok {
-		panel.activeUsersM.Unlock()
 		return user, nil
 	}
 
 	upRate, downRate, err := panel.Manager.AuthenticateUser(UID)
 	if err != nil {
-		panel.activeUsersM.Unlock()
 		return nil, err
 	}
 	valve := mux.MakeValve(upRate, downRate)
@@ -75,12 +80,18 @@ func (panel *userPanel) GetUser(UID []byte) (*ActiveUser, error) {
 
 	copy(user.arrUID[:], UID)
 	panel.activeUsers[user.arrUID] = user
-	panel.activeUsersM.Unlock()
+	log.WithFields(log.Fields{
+		"UID": base64.StdEncoding.EncodeToString(UID),
+	}).Info("New active user")
 	return user, nil
 }
 
 // TerminateActiveUser terminates a user and deletes its references
 func (panel *userPanel) TerminateActiveUser(user *ActiveUser, reason string) {
+	log.WithFields(log.Fields{
+		"UID":    base64.StdEncoding.EncodeToString(user.arrUID[:]),
+		"reason": reason,
+	}).Info("Terminating active user")
 	panel.updateUsageQueueForOne(user)
 	user.closeAllSessions(reason)
 	panel.activeUsersM.Lock()
@@ -156,6 +167,9 @@ func (panel *userPanel) commitUpdate() error {
 		panel.activeUsersM.RUnlock()
 		var numSession int
 		if user != nil {
+			if user.bypass {
+				continue
+			}
 			numSession = user.NumSession()
 		}
 		status := usermanager.StatusUpdate{
@@ -168,6 +182,8 @@ func (panel *userPanel) commitUpdate() error {
 		}
 		statuses = append(statuses, status)
 	}
+	panel.usageUpdateQueue = make(map[[16]byte]*usagePair)
+	panel.usageUpdateQueueM.Unlock()
 
 	responses, err := panel.Manager.UploadStatus(statuses)
 	if err != nil {
@@ -186,14 +202,12 @@ func (panel *userPanel) commitUpdate() error {
 			}
 		}
 	}
-	panel.usageUpdateQueue = make(map[[16]byte]*usagePair)
-	panel.usageUpdateQueueM.Unlock()
 	return nil
 }
 
 func (panel *userPanel) regularQueueUpload() {
 	for {
-		time.Sleep(1 * time.Minute)
+		time.Sleep(panel.uploadInterval)
 		go func() {
 			panel.updateUsageQueue()
 			err := panel.commitUpdate()
